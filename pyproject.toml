@@ -7,18 +7,12 @@ readme = "README.md"
 requires-python = ">= 3.12"
 dependencies = [
     "httpx>=0.28.1",
-    "pandas>=2.3.0",
+    "pandas==2.3.0",
 ]
 
 [tool.setuptools.packages.find]
 include = ["redash_pandas*"]
 exclude = ["credentials*", "tests*", "example.py"]
-
-[dependency-groups]
-dev = [
-    "mypy>=1.16.1",
-    "ruff>=0.12.1",
-]
 
 [tool.ruff]
 target-version = "py312"
