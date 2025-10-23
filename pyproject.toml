@@ -4,7 +4,7 @@ version = "0.1.5"
 description = "A simple wrapper class for easy querying of data from Redash."
 authors = [{ name = "Alex Ishida", email = "alex.weber.k@gmail.com" }]
 readme = "README.md"
-requires-python = ">= 3.12"
+requires-python = ">= 3.11"
 dependencies = [
     "httpx>=0.28.1",
     "pandas>=2.3.0",
@@ -47,7 +47,6 @@ ignore = [
     "D100",    # Missing docstring in public module
     "N812",    # Lowercase imported as non lowercase
     "D212",    # Multi-line docstring summary should start at the first line
-    "PD901",   # Avoid using the generic variable name `df` for DataFrames
     "BLE001",  # Do not catch blind exception: `Exception`
     "ANN401",  # Dynamically typed expressions (typing.Any) are disallowed in `__getattr__`
     "TRY003",  # Avoid specifying long messages outside the exception class
