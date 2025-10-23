@@ -49,9 +49,10 @@ class ProgressIndicator:
     def _animate(self) -> None:
         """Animation loop running in a separate thread."""
         while self.running:
-            elapsed = time.time() - self.start_time
-            spinner = next(self.spinner_chars)
-            print(f"\r{spinner} Processing... {elapsed:.1f}s", end="", flush=True)
+            if self.start_time is not None:
+                elapsed = time.time() - self.start_time
+                spinner = next(self.spinner_chars)
+                print(f"\r{spinner} Processing... {elapsed:.1f}s", end="", flush=True)
             time.sleep(self.sleep_interval)
 
 
@@ -65,6 +66,7 @@ class Redash:
         endpoint: str = "",
         default_timeout: int = 60,  # 60 seconds
         default_query_timeout: int = 60 * 5,  # 5 minutes
+        is_logging: bool = False,
         logging_level: int = logging.INFO,
     ) -> None:
         """
@@ -82,19 +84,25 @@ class Redash:
             - apikey: your Redash API key.
             - endpoint: the endpoint of the Redash instance. For example: https://redash.your_url.com
             - default_timeout: default timeout in seconds for all requests
-            - logging_level: logging level for this instance (default: logging.INFO)
             - default_query_timeout: default timeout in seconds for query requests (default: 60 * 5 = 5 minutes)
+            - is_logging: enable logging (default: False)
+            - logging_level: logging level for this instance (default: logging.INFO)
         """
         # Setup instance-specific logger
         self.logger = logging.getLogger(f"{__name__}.Redash")
-        self.logger.setLevel(logging_level)
+        self.is_logging = is_logging
 
-        # Add handler if none exists
-        if not self.logger.handlers:
-            handler = logging.StreamHandler()
-            formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-            handler.setFormatter(formatter)
-            self.logger.addHandler(handler)
+        if is_logging:
+            self.logger.setLevel(logging_level)
+            # Add handler if none exists
+            if not self.logger.handlers:
+                handler = logging.StreamHandler()
+                formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+                handler.setFormatter(formatter)
+                self.logger.addHandler(handler)
+        else:
+            # Disable all logging
+            self.logger.disabled = True
 
         if credentials:
             with Path(credentials).open(encoding="utf-8") as f:
@@ -114,24 +122,23 @@ class Redash:
         self.progress = ProgressIndicator()
         self.req: str | None = None
         self.res: httpx.Response | None = None
-        self.client = httpx.Client(timeout=default_timeout)  # Replace requests.Session
+        self.client = httpx.Client(
+            timeout=default_timeout, base_url=self.endpoint, headers={"Authorization": f"Key {self.apikey}"}
+        )
         self.default_timeout = default_timeout  # Store timeout for use in requests
         self.default_query_timeout = default_query_timeout
 
-    def _wait_for_job_status(
-        self, job_status_uri: str, job_status: JobStatus, query_wait_start_time: float, query_timeout: int
-    ) -> None:
-        """Waits for the job status to be updated."""
+    def _wait_for_job_status(self, job: dict, query_wait_start_time: float, query_timeout: int) -> dict:
+        """Waits for the job status to be updated and returns the final job state."""
+        job_status = job["status"]
         while job_status in (JobStatus.PENDING, JobStatus.STARTED):
             try:
-                self.res = self.client.get(job_status_uri, timeout=self.default_timeout)
-
+                job_id = job["id"]
+                self.res = self.client.get(f"/api/jobs/{job_id}")
                 http_bad_gateway = 502
                 if self.res.status_code == http_bad_gateway:
-                    self.logger.warning(
-                        "Gateway error (502) occurred for job %s. Returning empty DataFrame.", job_status_uri
-                    )
-                    return
+                    self.logger.warning("Gateway error (502) occurred for job %s. Returning empty DataFrame.", job_id)
+                    return job
 
                 job = self.res.json()["job"]
                 job_status = job["status"]
@@ -153,6 +160,8 @@ class Redash:
                 self.logger.exception("Error checking job status")
                 raise
 
+        return job
+
     def query(
         self,
         query_id: int | str,
@@ -165,7 +174,7 @@ class Redash:
         timeout = timeout or self.default_timeout
         query_timeout = query_timeout or self.default_query_timeout
         params = params or {}
-        self.req = self._build_query_uri(query_id, params)
+        self.req = self._build_query_uri(query_id)
 
         post_data: dict = {
             "parameters": {str(key): str(value) for key, value in params.items()},
@@ -174,8 +183,7 @@ class Redash:
 
         try:
             self.res = self.client.post(
-                self.req,
-                headers={"content-type": "application/json"},
+                f"/api/queries/{query_id}/results",
                 json=post_data,
                 timeout=timeout,
             )
@@ -213,12 +221,11 @@ class Redash:
             err_msg = f"{job['error']}\nMaybe, parameter value missing for query, or query timed out. \n\t{self.req}"
             raise RuntimeError(err_msg)
 
-        job_status_uri = f"{self.endpoint}/api/jobs/{job['id']}?api_key={self.apikey}"
-
         self.progress.start()
 
         try:
-            self._wait_for_job_status(job_status_uri, job_status, query_wait_start_time, query_timeout)
+            job = self._wait_for_job_status(job, query_wait_start_time, query_timeout)
+            job_status = job["status"]
         finally:
             self.progress.stop()
 
@@ -239,15 +246,38 @@ class Redash:
 
         try:
             query_result_id = job["query_result_id"]
+            self.logger.debug("Fetching query result with ID: %s", query_result_id)
             self.res = self.client.get(
-                f"{self.endpoint}/api/query_results/{query_result_id}?api_key={self.apikey}",
+                f"/api/query_results/{query_result_id}",
                 timeout=timeout,
             )
 
-            http_bad_gateway = 502
-            if self.res.status_code == http_bad_gateway:
-                self.logger.warning("Gateway error (502) occurred.")
-                raise RuntimeError("Gateway error (502) occurred.")
+            http_ok = 200
+            if self.res.status_code != http_ok:
+                self.logger.error(
+                    "HTTP error %s occurred when fetching query result ID %s",
+                    self.res.status_code,
+                    query_result_id,
+                )
+
+                def _raise_api_error() -> None:
+                    def _raise_parse_error(parse_error: Exception) -> None:
+                        err_msg = f"HTTP error {self.res.status_code}: {self.res.text}"
+                        raise RuntimeError(err_msg) from parse_error
+
+                    def _raise_message_error(error_response: dict) -> None:
+                        err_msg = f"API error ({self.res.status_code}): {error_response['message']}"
+                        raise RuntimeError(err_msg)
+
+                    try:
+                        error_response = self.res.json()
+                        print(error_response)
+                        if "message" in error_response:
+                            _raise_message_error(error_response)
+                    except Exception as parse_error:
+                        _raise_parse_error(parse_error)
+
+                _raise_api_error()
 
             result = self.res.json()
         except httpx.TimeoutException:
