@@ -16,8 +16,8 @@ exclude = ["credentials*", "tests*", "example.py"]
 
 [dependency-groups]
 dev = [
-    "mypy>=1.16.1",
-    "ruff>=0.12.1",
+    "mypy>=1.18.2",
+    "ruff>=0.14.1",
 ]
 
 [tool.ruff]
