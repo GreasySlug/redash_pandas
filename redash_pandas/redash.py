@@ -21,11 +21,31 @@ class JobStatus(IntEnum):
 
 
 class ProgressIndicator:
-    """A progress indicator with spinner and elapsed time display."""
+    """
+    A progress indicator with spinner and elapsed time display.
 
-    def __init__(self, sleep_interval: float = 0.1) -> None:
+    Can be used as a context manager for automatic start/stop.
+
+    Example:
+        with ProgressIndicator() as progress:
+            # Do some work...
+            time.sleep(5)
+        # Progress indicator automatically stopped
+
+    """
+
+    def __init__(self, sleep_interval: float = 0.1, join_timeout: float = 2.0) -> None:
+        """
+        Initialize the progress indicator.
+
+        Args:
+            sleep_interval: Time between spinner updates in seconds (default: 0.1)
+            join_timeout: Maximum time to wait for thread termination in seconds (default: 2.0)
+
+        """
         self.spinner_chars = cycle(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"])
         self.sleep_interval = sleep_interval
+        self.join_timeout = join_timeout
         self.running = False
         self.thread: threading.Thread | None = None
         self.start_time: float | None = None
@@ -36,15 +56,24 @@ class ProgressIndicator:
             return
         self.running = True
         self.start_time = time.time()
-        self.thread = threading.Thread(target=self._animate, daemon=True)
+        self.thread = threading.Thread(target=self._animate, daemon=False)
         self.thread.start()
 
     def stop(self) -> None:
-        """Stop the progress indicator."""
+        """Stop the progress indicator and wait for thread to terminate."""
+        if not self.running:
+            return
+
         self.running = False
-        if self.thread:
-            self.thread.join(timeout=0.1)
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=self.join_timeout)
+
+            if self.thread.is_alive():
+                logger = logging.getLogger(__name__)
+                logger.warning("Progress indicator thread did not terminate within %s seconds", self.join_timeout)
+
         print("\r" + " " * 50 + "\r", end="", flush=True)
+        self.thread = None
 
     def _animate(self) -> None:
         """Animation loop running in a separate thread."""
@@ -55,9 +84,35 @@ class ProgressIndicator:
                 print(f"\r{spinner} Processing... {elapsed:.1f}s", end="", flush=True)
             time.sleep(self.sleep_interval)
 
+    def __enter__(self) -> "ProgressIndicator":
+        """Enter the context manager and start the progress indicator."""
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:
+        """Exit the context manager and stop the progress indicator."""
+        self.stop()
+
 
 class Redash:
-    "A simple wrapper class for easy querying of data from Redash using httpx."
+    """
+    A simple wrapper class for easy querying of data from Redash using httpx.
+
+    Can be used as a context manager for proper resource management.
+
+    Example:
+        # Using context manager (recommended)
+        with Redash(credentials="path/to/credentials.json") as redash:
+            df = redash.query(query_id=123)
+
+        # Or traditional usage
+        redash = Redash(credentials="path/to/credentials.json")
+        try:
+            df = redash.query(query_id=123)
+        finally:
+            redash.close()
+
+    """
 
     def __init__(
         self,
@@ -129,20 +184,48 @@ class Redash:
         self.default_query_timeout = default_query_timeout
 
     def _wait_for_job_status(self, job: dict, query_wait_start_time: float, query_timeout: int) -> dict:
-        """Waits for the job status to be updated and returns the final job state."""
+        """
+        Waits for the job status to be updated and returns the final job state.
+
+        Uses adaptive polling with exponential backoff:
+        - Starts with 0.5s interval
+        - Doubles interval up to 5s maximum
+        - Reduces load on API while maintaining responsiveness
+        """
         job_status = job["status"]
+        poll_interval = 0.5
+        max_poll_interval = 5.0
+        backoff_multiplier = 1.5
+        consecutive_502_errors = 0
+        max_502_retries = 3
+
         while job_status in (JobStatus.PENDING, JobStatus.STARTED):
             try:
                 job_id = job["id"]
                 self.res = self.client.get(f"/api/jobs/{job_id}")
-                http_bad_gateway = 502
+
+                http_bad_gateway = httpx.codes.BAD_GATEWAY
                 if self.res.status_code == http_bad_gateway:
-                    self.logger.warning("Gateway error (502) occurred for job %s. Returning empty DataFrame.", job_id)
-                    return job
+                    consecutive_502_errors += 1
+                    self.logger.warning(
+                        "Gateway error (502) occurred for job %s (attempt %d/%d)",
+                        job_id,
+                        consecutive_502_errors,
+                        max_502_retries,
+                    )
+
+                    if consecutive_502_errors >= max_502_retries:
+                        err_msg = f"Gateway error persisted after {max_502_retries} retries for job {job_id}"
+                        raise RuntimeError(err_msg)
+
+                    time.sleep(min(poll_interval * 2, max_poll_interval))
+                    continue
+
+                consecutive_502_errors = 0
 
                 job = self.res.json()["job"]
                 job_status = job["status"]
-                self.logger.debug("Job status check in progress...")  # Progress indicator
+                self.logger.debug("Job status: %s (polling interval: %.1fs)", job_status, poll_interval)
 
                 # Handle cases where the JobStatus does not update but the query is stale.
                 query_wait_time = time.time() - query_wait_start_time
@@ -150,8 +233,8 @@ class Redash:
                     err_msg = f"Query wait time exceeded {query_timeout} seconds"
                     raise RuntimeError(err_msg)
 
-                # Wait 1 second before next check
-                time.sleep(1)
+                time.sleep(poll_interval)
+                poll_interval = min(poll_interval * backoff_multiplier, max_poll_interval)
 
             except httpx.TimeoutException:
                 self.logger.exception("Job status check timed out after %s seconds", self.default_timeout)
@@ -221,13 +304,9 @@ class Redash:
             err_msg = f"{job['error']}\nMaybe, parameter value missing for query, or query timed out. \n\t{self.req}"
             raise RuntimeError(err_msg)
 
-        self.progress.start()
-
-        try:
+        with self.progress:
             job = self._wait_for_job_status(job, query_wait_start_time, query_timeout)
             job_status = job["status"]
-        finally:
-            self.progress.stop()
 
         if job_status == JobStatus.FAILURE:
             err_msg = job["error"]
@@ -399,7 +478,15 @@ class Redash:
         if interval not in ("day", "week", "month", "quarter", "year"):
             raise ValueError("`interval` must be one of 'day', 'week', 'month', 'quarter', 'year'.")
 
-        start_dates = pd.date_range(start=start_date, end=end_date, freq=interval.freq_code)
+        # Map interval string to pandas frequency code
+        freq_map = {
+            "day": "D",
+            "week": "W",
+            "month": "MS",  # Month Start
+            "quarter": "QS",  # Quarter Start
+            "year": "YS",  # Year Start
+        }
+        start_dates = pd.date_range(start=start_date, end=end_date, freq=freq_map[interval])
         # create offset of interval_multiple
         user_input_start_date = pd.to_datetime(start_date)
 
@@ -449,7 +536,16 @@ class Redash:
 
         return uri
 
-    def __del__(self) -> None:
-        """Close the httpx client when the object is destroyed."""
-        if hasattr(self, "client"):
+    def close(self) -> None:
+        """Close the httpx client and release resources."""
+        if hasattr(self, "client") and self.client is not None:
             self.client.close()
+            self.logger.debug("HTTP client closed successfully")
+
+    def __enter__(self) -> "Redash":
+        """Enter the context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> None:  # type: ignore[no-untyped-def]
+        """Exit the context manager and clean up resources."""
+        self.close()
